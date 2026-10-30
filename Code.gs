@@ -1,5 +1,11 @@
 /**
- * BackUpBrain Pipeline - resilient Google Docs version
+ * BackUpBrain Pipeline - Gemini + Granola
+ *
+ * Replace your existing script with this entire file in the SAME Apps Script project.
+ * Set GRANOLA_API_KEY in Project Settings > Script properties.
+ * Existing trigger function and processing history are preserved.
+ * Granola notes are imported once, with summary and full available transcript.
+ * Pending writes block later ingestion until verified or manually reviewed.
  *
  * Important changes:
  * - Uses a character limit, not a word limit. Google Docs supports up to
@@ -42,6 +48,17 @@ const RETRY_BASE_DELAY_MS = 1000;
 const PIPELINE_LOCK_WAIT_MS = 30000;
 
 
+// Granola imports are optional when no API key is configured.
+const GRANOLA_ENABLED = true;
+const GRANOLA_API_BASE = 'https://public-api.granola.ai/v1';
+const GRANOLA_CREATED_AFTER = ''; // Optional ISO date, e.g. '2026-10-01'. Blank imports history.
+const GRANOLA_FOLDER_ID = ''; // Optional Granola folder ID (not a Google Drive ID).
+const GRANOLA_MAX_NOTES_PER_RUN = 10;
+const GRANOLA_SCAN_PROPERTY = 'GRANOLA_SCAN_STATE_V1';
+const PENDING_APPEND_PROPERTY = 'BACKUPBRAIN_PENDING_APPEND_V1';
+const RUN_BUDGET_MS = 270000;
+let pipelineStartedAt_ = 0;
+
 /***********************
  * MAIN PIPELINE
  ***********************/
@@ -53,14 +70,27 @@ function runGeminiToBackUpBrainPipeline() {
   }
 
   try {
-    Logger.log('=== START: Gemini Notes -> BackUpBrain ===');
+    pipelineStartedAt_ = Date.now();
+    Logger.log('=== START: Gemini + Granola -> BackUpBrain ===');
+    recoverPendingAppend_();
 
     // Validate all configured folders before changing Gmail labels or copying files.
     getFolderOrThrow_(MEET_RECORDINGS_FOLDER_ID, 'Meet Recordings');
     getFolderOrThrow_(PROCESSED_FOLDER_ID, 'Logged Meets');
     getFolderOrThrow_(MASTER_DOCS_FOLDER_ID, 'Master Docs');
 
-    const copySummary = moveGeminiNotesDocsToMeetRecordings_();
+    const copySummary = {};
+    // A source failure must not stop the other source or already-staged files.
+    try { copySummary.gemini = moveGeminiNotesDocsToMeetRecordings_(); }
+    catch (err) {
+      copySummary.gemini = { error: formatError_(err) };
+      Logger.log('Gemini import error: ' + formatError_(err));
+    }
+    try { copySummary.granola = copyGranolaNotesToMeetRecordings_(); }
+    catch (err) {
+      copySummary.granola = { error: formatError_(err) };
+      Logger.log('Granola import error: ' + formatError_(err));
+    }
     const ingestSummary = runBackUpBrainIngestion_();
 
     Logger.log('=== PIPELINE COMPLETE ===');
@@ -87,7 +117,7 @@ function moveGeminiNotesDocsToMeetRecordings_() {
     GmailApp.createLabel(TARGET_LABEL_NAME);
   const meetFolder = getFolderOrThrow_(MEET_RECORDINGS_FOLDER_ID, 'Meet Recordings');
   const processedFolder = getFolderOrThrow_(PROCESSED_FOLDER_ID, 'Logged Meets');
-  const threads = sourceLabel.getThreads();
+  const threads = sourceLabel.getThreads(0, 20);
   const processedSourceDocIds = getJsonObjectProperty_(PROCESSED_SOURCE_DOC_IDS_PROPERTY);
   const seenThisRun = {};
 
@@ -102,6 +132,7 @@ function moveGeminiNotesDocsToMeetRecordings_() {
   };
 
   for (let i = 0; i < threads.length; i++) {
+    if (pipelineTimeLow_(90000)) break;
     const thread = threads[i];
 
     if (threadHasLabel_(thread, targetLabel)) {
@@ -111,6 +142,7 @@ function moveGeminiNotesDocsToMeetRecordings_() {
 
     const messages = thread.getMessages();
     let handledAnything = false;
+    let threadFailed = false;
 
     for (let j = 0; j < messages.length; j++) {
       const links = extractGoogleDocLinks_(messages[j].getBody());
@@ -166,13 +198,14 @@ function moveGeminiNotesDocsToMeetRecordings_() {
           handledAnything = true;
           Logger.log('Copied: ' + sourceTitle + ' | copy ID: ' + copiedFile.getId());
         } catch (err) {
+          threadFailed = true;
           summary.copyErrors++;
           Logger.log('Failed to copy ' + links[k] + ' | ' + formatError_(err));
         }
       }
     }
 
-    if (handledAnything) {
+    if (handledAnything && !threadFailed) {
       thread.removeLabel(sourceLabel);
       thread.addLabel(targetLabel);
       summary.threadsProcessed++;
@@ -198,6 +231,7 @@ function runBackUpBrainIngestion_() {
   const summary = { filesProcessed: 0, filesSkipped: 0, duplicateFilesMoved: 0, ingestionErrors: 0 };
 
   while (files.hasNext()) {
+    if (pipelineTimeLow_(45000)) break;
     const file = files.next();
     let fileName = '(name unavailable)';
     try {
@@ -241,6 +275,7 @@ function runBackUpBrainIngestion_() {
       // Append function returns only after a fresh open verifies the commit marker.
       ingestedFileIds[fileId] = true;
       setJsonObjectProperty_(INGESTED_FILE_IDS_PROPERTY, ingestedFileIds);
+      PropertiesService.getScriptProperties().deleteProperty(PENDING_APPEND_PROPERTY);
       if (sourceDocId) {
         const processedIds = getJsonObjectProperty_(PROCESSED_SOURCE_DOC_IDS_PROPERTY);
         processedIds[sourceDocId] = true;
@@ -256,6 +291,8 @@ function runBackUpBrainIngestion_() {
       summary.ingestionErrors++;
       Logger.log('Error processing file: ' + fileName + ' | ' + formatError_(err));
       try { Logger.log('File URL: ' + file.getUrl()); } catch (ignored) {}
+      // Stop on an uncertain commit; don't rotate masters or write more files.
+      if (PropertiesService.getScriptProperties().getProperty(PENDING_APPEND_PROPERTY)) throw err;
     }
   }
   setJsonObjectProperty_(INGESTED_FILE_IDS_PROPERTY, ingestedFileIds);
@@ -268,6 +305,10 @@ function runBackUpBrainIngestion_() {
  ***********************/
 function appendMeetingNoteSafely_(fileName, importedOn, sourceDocId, content, marker) {
   const entryCharCount = estimateEntryCharCount_(fileName, importedOn, sourceDocId, content, marker);
+  recoverPendingAppend_();
+  if (entryCharCount > MAX_CHARS_PER_MASTER_DOC) {
+    throw new Error('Entry exceeds the configured master size. Split this note before ingestion.');
+  }
   let state = getWritableMasterDoc_();
   if (state.charCount + entryCharCount > MAX_CHARS_PER_MASTER_DOC) {
     closeQuietly_(state.doc);
@@ -280,6 +321,9 @@ function appendMeetingNoteSafely_(fileName, importedOn, sourceDocId, content, ma
     const docId = state.id;
     let doc = state.doc;
     try {
+      // Persist BEFORE editing: a terminated execution can otherwise lose its commit state.
+      PropertiesService.getScriptProperties().setProperty(PENDING_APPEND_PROPERTY,
+        JSON.stringify({ masterDocId: docId, marker: marker, fileName: fileName }));
       const body = doc.getBody();
       if (body.getText().indexOf(marker) === -1) {
         body.appendHorizontalRule();
@@ -682,19 +726,55 @@ function escapeRegExp_(text) {
 
 
 function getJsonObjectProperty_(propertyName) {
-  const raw = PropertiesService.getScriptProperties().getProperty(propertyName);
+  const props = PropertiesService.getScriptProperties();
+  const raw = props.getProperty(propertyName);
   if (!raw) return {};
-  try { return JSON.parse(raw); } catch (err) {
-    throw new Error('Invalid registry property ' + propertyName + '; refusing to reset processing history: ' + formatError_(err));
+  try {
+    const value = JSON.parse(raw);
+    if (value && value.__backupbrainChunks === 1) {
+      let joined = '';
+      for (let i = 0; i < value.count; i++) {
+        const chunk = props.getProperty(value.prefix + i);
+        if (chunk === null) throw new Error('Missing history chunk ' + i);
+        joined += chunk;
+      }
+      return JSON.parse(joined);
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('History must be an object');
+    }
+    return value;
+  } catch (err) {
+    throw new Error('Invalid registry ' + propertyName + '; refusing to reset history: ' + formatError_(err));
   }
 }
 
-
 function setJsonObjectProperty_(propertyName, objectValue) {
-  PropertiesService.getScriptProperties()
-    .setProperty(propertyName, JSON.stringify(objectValue));
+  const props = PropertiesService.getScriptProperties();
+  const previousRaw = props.getProperty(propertyName);
+  const previous = previousRaw ? JSON.parse(previousRaw) : null;
+  const json = JSON.stringify(objectValue);
+  // ASCII escaping keeps each 7,000-character chunk under the 9 KB value quota.
+  const escaped = json.replace(/[\u007f-\uffff]/g, function (c) {
+    return '\\u' + ('0000' + c.charCodeAt(0).toString(16)).slice(-4);
+  });
+  if (escaped.length <= 7000) {
+    props.setProperty(propertyName, escaped);
+  } else {
+    const prefix = propertyName + '_CHUNK_' + Utilities.getUuid() + '_';
+    const count = Math.ceil(escaped.length / 7000);
+    for (let i = 0; i < count; i++) {
+      props.setProperty(prefix + i, escaped.substring(i * 7000, (i + 1) * 7000));
+    }
+    // Publish the manifest only after all new chunks exist.
+    props.setProperty(propertyName, JSON.stringify({
+      __backupbrainChunks: 1, prefix: prefix, count: count
+    }));
+  }
+  if (previous && previous.__backupbrainChunks === 1) {
+    for (let i = 0; i < previous.count; i++) props.deleteProperty(previous.prefix + i);
+  }
 }
-
 
 /***********************
  * NOTEBOOKLM NOTIFICATION
@@ -775,6 +855,7 @@ function forceCreateRecoveryMaster() {
   const lock = LockService.getScriptLock();
   lock.waitLock(PIPELINE_LOCK_WAIT_MS);
   try {
+    recoverPendingAppend_();
     const state = createNextMasterDoc_();
     const result = { id: state.id, index: state.index, name: state.doc.getName() };
     closeQuietly_(state.doc);
@@ -806,4 +887,217 @@ function addSourceDocIdsFromFolderToRegistry_(folder, registry) {
     const sourceDocId = getSourceDocIdFromCopiedFile_(files.next());
     if (sourceDocId) registry[sourceDocId] = true;
   }
+}
+
+/***********************
+ * GRANOLA NOTES + FULL TRANSCRIPTS
+ ***********************/
+function copyGranolaNotesToMeetRecordings_() {
+  const props = PropertiesService.getScriptProperties();
+  if (!GRANOLA_ENABLED) return { skipped: 'Granola disabled' };
+  if (!props.getProperty('GRANOLA_API_KEY')) {
+    Logger.log('Granola skipped: add GRANOLA_API_KEY to Script properties.');
+    return { skipped: 'Missing GRANOLA_API_KEY; Gemini still runs' };
+  }
+  const inbox = getFolderOrThrow_(MEET_RECORDINGS_FOLDER_ID, 'Meeting intake');
+  const processed = getFolderOrThrow_(PROCESSED_FOLDER_ID, 'Processed meetings');
+  let basePath = '/notes?page_size=30';
+  if (GRANOLA_CREATED_AFTER) basePath += '&created_after=' + encodeURIComponent(GRANOLA_CREATED_AFTER);
+  if (GRANOLA_FOLDER_ID) basePath += '&folder_id=' + encodeURIComponent(GRANOLA_FOLDER_ID);
+  const raw = props.getProperty(GRANOLA_SCAN_PROPERTY);
+  let state = raw ? JSON.parse(raw) : null;
+  if (!state || state.query !== basePath) state = { query: basePath, cursor: null, index: 0 };
+  const summary = { notesChecked: 0, filesCreated: 0, duplicates: 0, deferred: 0, errors: 0, scanComplete: false };
+  const seenCursors = {};
+  let attempted = 0;
+  while (!pipelineTimeLow_(105000)) {
+    const path = basePath + (state.cursor ? '&cursor=' + encodeURIComponent(state.cursor) : '');
+    let page;
+    try { page = granolaGetJson_(path); }
+    catch (err) {
+      // A saved cursor may expire. Restart the scan next time; staged IDs prevent repeats.
+      if (state.cursor && err.granolaStatus === 400) props.deleteProperty(GRANOLA_SCAN_PROPERTY);
+      throw err;
+    }
+    validateGranolaPage_(page, 'notes');
+    for (let i = state.index; i < page.notes.length; i++) {
+      if (attempted >= GRANOLA_MAX_NOTES_PER_RUN || pipelineTimeLow_(105000)) return summary;
+      const note = page.notes[i];
+      summary.notesChecked++;
+      try {
+        if (!note || !note.id) throw new Error('Granola note has no ID');
+        if (!note.deleted_at) {
+          const fileName = 'Granola - ' + String(note.id).toLowerCase() + '.txt';
+          if (inbox.getFilesByName(fileName).hasNext() || processed.getFilesByName(fileName).hasNext()) {
+            summary.duplicates++;
+          } else {
+            attempted++;
+            const detail = granolaGetJson_('/notes/' + encodeURIComponent(note.id));
+            const summaryText = detail.summary_text || detail.summary_markdown || '';
+            const updated = Date.parse(detail.updated_at || note.updated_at || '');
+            // Wait for generated notes and a quiet period before taking a one-time snapshot.
+            if (!summaryText.trim() || !Number.isFinite(updated) || Date.now() - updated < 10 * 60 * 1000) {
+              summary.deferred++;
+            } else {
+              const parts = granolaGetTranscript_(note.id);
+              const transcript = parts.filter(function (part) {
+                return typeof part.text === 'string' && part.text.trim();
+              }).map(function (part) {
+                const speaker = part.speaker || {};
+                const label = speaker.name || speaker.diarization_label ||
+                  speaker.attribution || speaker.source || 'Unknown speaker';
+                return (part.start_time ? '[' + part.start_time + '] ' : '') + label + ': ' + part.text;
+              }).join('\n\n');
+              if (!transcript) {
+                // Don't permanently mark summary-only notes as successfully imported.
+                summary.deferred++;
+              } else {
+                const text = [
+                  'Meeting: ' + (detail.title || note.title || 'Untitled meeting'),
+                  'Source: Granola',
+                  'Granola note ID: ' + note.id,
+                  'Note created: ' + (detail.created_at || note.created_at || ''),
+                  'Meeting start: ' + ((detail.calendar_event || {}).scheduled_start_time || ''),
+                  'Source URL: ' + (detail.web_url || ''),
+                  '', 'GRANOLA NOTES', '', summaryText,
+                  '', 'FULL TRANSCRIPT', '', transcript
+                ].join('\n');
+                // Fetch every page before creating any intake file.
+                if (text.length > MAX_SINGLE_NOTE_CHARS || text.length + 1000 > MAX_CHARS_PER_MASTER_DOC) {
+                  throw new Error('Granola note is too large; split it before importing.');
+                }
+                // Do not retry creation: an uncertain response can conceal a successful create.
+                inbox.createFile(fileName, text, MimeType.PLAIN_TEXT);
+                summary.filesCreated++;
+                Logger.log('Staged Granola meeting: ' + (detail.title || note.id));
+              }
+            }
+          }
+        }
+      } catch (err) {
+        if (err.backupbrainDeadline) return summary; // Revisit this note next run.
+        summary.errors++;
+        Logger.log('Granola note ' + (note && note.id) + ': ' + formatError_(err));
+        if (err.granolaStatus === 401 || err.granolaStatus === 403) throw err;
+        // Advance the scan, but retry failed/deferred notes on the next full scan.
+      }
+      state.index = i + 1;
+      props.setProperty(GRANOLA_SCAN_PROPERTY, JSON.stringify(state));
+    }
+    if (!page.hasMore) {
+      props.deleteProperty(GRANOLA_SCAN_PROPERTY);
+      summary.scanComplete = true;
+      return summary;
+    }
+    if (seenCursors[page.cursor] || page.cursor === state.cursor) throw new Error('Repeated Granola list cursor');
+    seenCursors[page.cursor] = true;
+    state.cursor = page.cursor;
+    state.index = 0;
+    props.setProperty(GRANOLA_SCAN_PROPERTY, JSON.stringify(state));
+  }
+  return summary;
+}
+
+function granolaGetTranscript_(noteId) {
+  const base = '/notes/' + encodeURIComponent(noteId) + '/transcript?page_size=100';
+  let path = base;
+  const parts = [];
+  const seen = {};
+  let characters = 0;
+  while (path) {
+    const page = granolaGetJson_(path);
+    validateGranolaPage_(page, 'transcript');
+    page.transcript.forEach(function (part) {
+      characters += String(part.text || '').length;
+      if (characters > MAX_SINGLE_NOTE_CHARS) throw new Error('Transcript exceeds per-note limit');
+      parts.push(part);
+    });
+    if (!page.hasMore) break;
+    if (seen[page.cursor]) throw new Error('Repeated Granola transcript cursor');
+    seen[page.cursor] = true;
+    path = base + '&cursor=' + encodeURIComponent(page.cursor);
+  }
+  return parts;
+}
+
+function validateGranolaPage_(page, field) {
+  if (!page || !Array.isArray(page[field]) || typeof page.hasMore !== 'boolean' ||
+      (page.hasMore && (typeof page.cursor !== 'string' || !page.cursor))) {
+    throw new Error('Unexpected Granola response for ' + field);
+  }
+}
+
+function granolaGetJson_(path) {
+  const key = PropertiesService.getScriptProperties().getProperty('GRANOLA_API_KEY');
+  if (!key) throw new Error('Missing GRANOLA_API_KEY');
+  for (let attempt = 1; attempt <= RETRY_ATTEMPTS; attempt++) {
+    if (pipelineTimeLow_(90000)) {
+      const err = new Error('Granola staging paused to leave time for master ingestion');
+      err.backupbrainDeadline = true;
+      throw err;
+    }
+    Utilities.sleep(250);
+    let response;
+    try {
+      response = UrlFetchApp.fetch(GRANOLA_API_BASE + path, {
+        method: 'get',
+        headers: { Authorization: 'Bearer ' + key, Accept: 'application/json' },
+        muteHttpExceptions: true,
+        followRedirects: false
+      });
+    } catch (err) {
+      // GET requests can safely be retried after transport failures.
+      if (attempt === RETRY_ATTEMPTS) throw new Error('Granola network request failed');
+      Utilities.sleep(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1));
+      continue;
+    }
+    const code = response.getResponseCode();
+    if (code === 200) return JSON.parse(response.getContentText());
+    const retryable = code === 429 || code >= 500;
+    if (!retryable || attempt === RETRY_ATTEMPTS) {
+      const err = new Error('Granola API HTTP ' + code + ' (check key, access, or API availability)');
+      err.granolaStatus = code;
+      throw err;
+    }
+    const headers = response.getAllHeaders();
+    const value = headers['Retry-After'] || headers['retry-after'];
+    const seconds = Number(value);
+    const serverDelay = Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 :
+      (value ? Math.max(0, Date.parse(String(value)) - Date.now()) : 0);
+    const delay = Math.max(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1), serverDelay || 0);
+    if (delay > 30000 || pipelineTimeLow_(90000 + delay)) {
+      throw new Error('Granola rate limited/unavailable; retry on next scheduled run');
+    }
+    Utilities.sleep(delay);
+  }
+  throw new Error('Granola request failed');
+}
+
+function pipelineTimeLow_(reserveMs) {
+  return pipelineStartedAt_ > 0 && Date.now() - pipelineStartedAt_ >= RUN_BUDGET_MS - reserveMs;
+}
+
+/***********************
+ * PERSISTED APPEND RECOVERY
+ ***********************/
+function recoverPendingAppend_() {
+  const props = PropertiesService.getScriptProperties();
+  const raw = props.getProperty(PENDING_APPEND_PROPERTY);
+  if (!raw) return;
+  const pending = JSON.parse(raw);
+  if (!pending.masterDocId || !pending.marker || pending.marker.indexOf(INGESTION_MARKER_PREFIX) !== 0) {
+    throw new Error('Invalid pending-append record; manual review required.');
+  }
+  // If verification throws or returns false, leave the journal in place.
+  if (!verifyIngestionMarker_(pending.masterDocId, pending.marker)) {
+    throw new Error('Ingestion paused: review master ' + pending.masterDocId +
+      ' for ' + pending.fileName + '. Missing commit marker: ' + pending.marker +
+      '. See the setup/recovery instructions before clearing ' + PENDING_APPEND_PROPERTY + '.');
+  }
+  const fileId = pending.marker.substring(INGESTION_MARKER_PREFIX.length);
+  const registry = getJsonObjectProperty_(INGESTED_FILE_IDS_PROPERTY);
+  registry[fileId] = true;
+  setJsonObjectProperty_(INGESTED_FILE_IDS_PROPERTY, registry);
+  props.deleteProperty(PENDING_APPEND_PROPERTY);
+  Logger.log('Recovered a verified append for ' + pending.fileName);
 }
